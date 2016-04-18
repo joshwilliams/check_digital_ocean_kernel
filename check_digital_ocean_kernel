@@ -1,0 +1,205 @@
+#!/usr/bin/env perl
+
+# check_digital_ocean_kernel
+# Check for a Digital Ocean Droplet's kernel and ensure it's current
+# by Josh Williams <jwilliams@endpoint.com>
+#
+# Copyright © 2016 End Point Corporation, http://www.endpoint.com/
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+use strict;
+use warnings;
+
+use Getopt::Long qw( :config no_ignore_case bundling );
+use LWP::UserAgent;
+use JSON;
+
+our $VERSION = '0.1';
+
+#
+# Parse options
+#
+
+my %opt;
+my $parse = GetOptions(
+    \%opt,
+    qw(
+        debug
+        help|h
+        version|V
+        key|k=s
+        timeout|t:i
+        verbose|v+
+        list|l
+        hostname|H=s
+        critical|c!
+    )
+);
+if (! $parse
+    or $opt{help}
+    or (!$opt{version} and !$opt{key})
+    or (!$opt{list} and !$opt{hostname} and !$opt{version})
+) {
+    die <<"USAGE";
+Usage: $0 [options]
+
+Information:
+-h, --help           output this help and exit
+-V, --version        show version and exit
+
+Required for actions below:
+-k, --key=KEY        Digital Ocean API Key
+
+Actions:
+-l, --list           list available hostnames (for human consumption)
+-H, --hostname=NAME  hostname to check data transfer usage
+
+Options:
+-t, --timeout=NUM    seconds to wait before aborting web service calls
+-c, --critical       return critical instead of warning on kernel mismatch
+-v, --verbose        show more detail; use up to three times to increase the level
+USAGE
+}
+
+if ($opt{version}) {
+    print "check_digital_ocean_kernel $VERSION\n";
+    exit;
+}
+
+$opt{verbose} ||= 0;
+my @verbose;
+
+#
+# Make web service calls
+#
+
+my $ua = LWP::UserAgent->new(agent => "endpoint-dokernel-bot/$VERSION");
+$ua->default_header('Accept-Encoding' => scalar HTTP::Message::decodable());
+$ua->default_header('Authorization' => "Bearer $opt{key}");
+$ua->timeout($opt{timeout}) if $opt{timeout};
+
+my $api_url_base = 'https://api.digitalocean.com';
+my $api_url_rest_base = $api_url_base . '/v2/';
+
+
+my %hostname_to_id;
+
+my @droplets
+= webservice_get(
+        $api_url_rest_base . "droplets",
+        "droplets",
+        "list of droplets",
+    );
+
+foreach my $droplet (@droplets) {
+    $hostname_to_id{$droplet->{name}} = $droplet;
+}
+
+if ($opt{list}) {
+    print map { $_, "\n" } keys %hostname_to_id;
+    print @verbose if @verbose;
+    exit;
+}
+
+my $server;
+unless ($server = $hostname_to_id{$opt{hostname}}) {
+    nagios_die("Unknown hostname: $opt{hostname}\n");
+}
+
+# Filter on the first three words, which tends to be "$OS $version $arch"
+my $kernel_filter = join ' ', (split /\s+/, $server->{kernel}->{name})[0..2];
+
+my @kernels
+    = webservice_get(
+        $api_url_rest_base . "droplets/$server->{id}/kernels",
+        "kernels",
+        "list of kernels",
+    );
+my @valid_kernels = sort { $b->{id} <=> $a->{id} } grep { $_->{name} =~ /^$kernel_filter/ } @kernels;
+
+# Try to match kernel by ID
+my $status_code = 3;   # default to unknown
+my $message = 'Could not match currently selected kernel';
+
+if ($server->{kernel}->{id} == $valid_kernels[0]->{id}) {
+    $status_code = 0;
+    $message = "Configured kernel $server->{kernel}->{name} matches most recent available";
+}
+else {
+    if (defined $opt{critical}) {
+        $status_code = 2;
+    }
+    else {
+        $status_code = 1;
+    }
+    $message = "Newer kernel $valid_kernels[0]->{name} available in Digital Ocean droplet configuration";
+}
+
+my $status_message = {
+    0 => 'OK',
+    1 => 'WARNING',
+    2 => 'CRITICAL',
+    3 => 'UNKNOWN',
+}->{$status_code};
+
+print "DO KERNEL $status_message: $message\n";
+
+exit $status_code;
+
+
+#
+# Subroutines
+#
+
+sub nagios_die {
+    print "ERROR: ", shift;
+    print @verbose if @verbose;
+    exit 3;
+}
+
+sub webservice_get {
+    my ($url, $key, $title, $processor) = @_;
+    my @result = ();
+    $url .= "?per_page=200";
+    while ($url) {
+        eval {
+            my $response = $ua->get($url);
+            if ($response->is_success) {
+                my $json = $response->decoded_content;
+                push @verbose, $json if $opt{verbose} >= 3;
+                my $page = decode_json($json);
+                push(@result, @{$page->{$key}});
+                $url = "";
+                if (exists $page->{links}->{pages}->{next}) {
+                    $url = $page->{links}->{pages}->{next};
+                }
+            }
+            else {
+                my $msg = $response->status_line . "\n";
+                push @verbose, $response->decoded_content . "\n" if $opt{verbose} >= 3;
+                die $msg;
+            }
+        };
+    }
+    if ($@) {
+        chomp $@;
+        nagios_die("Error retrieving $title: $@\n");
+    }
+    if (ref $processor eq 'CODE') {
+        return $processor->(@result);
+    }
+    return @result;
+}
+

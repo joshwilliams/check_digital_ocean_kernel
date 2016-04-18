@@ -1,0 +1,9 @@
+check_digital_ocean_kernel
+
+A small Nagios check that interfaces with the Digital Ocean API, and
+reports whether a droplet's configured kernel matches the most recent
+kernel in the series.
+
+This is similar to a check for OS distribution package updates, but
+since the kernel is set in a droplet's configuration this instead checks
+that instead.
